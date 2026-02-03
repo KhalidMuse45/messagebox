@@ -3,6 +3,11 @@ from flask_cors import CORS
 import csv
 import io
 
+try:
+    from gemini_client import ask_question as gemini_ask_question
+except Exception:
+    gemini_ask_question = None  # e.g. ImportError or ValueError (missing API key)
+
 app = Flask(__name__, template_folder='.', static_folder='.')
 CORS(app)  # Enable CORS for frontend requests
 
@@ -82,29 +87,69 @@ def get_movie_poster(movie_title):
     return "images/placeholder.jpg"
 
 
+def _parse_gemini_recommendations(text):
+    """Parse Gemini response into list of dicts: title, year, director, why_it_fits."""
+    if not text or (isinstance(text, str) and "Error:" in text):
+        return []
+    text = text.strip()
+    # Normalize: sometimes Gemini wraps in markdown or uses different spacing
+    if text.startswith("```"):
+        text = text.split("```", 2)[-1].strip()
+    recommendations = []
+    blocks = [b.strip() for b in text.split("#") if b.strip()]
+    # If no # delimiter, try splitting by "Title" line (one block per movie)
+    if not blocks and "Title" in text:
+        parts = text.replace("\r", "\n").split("\n")
+        current = []
+        for line in parts:
+            line = line.strip()
+            if line.lower().startswith("title") and ":" in line:
+                if current and any("title" in l.lower() for l in current):
+                    blocks.append("\n".join(current))
+                current = [line]
+            elif current:
+                current.append(line)
+        if current:
+            blocks.append("\n".join(current))
+    for block in blocks[:3]:
+        movie = {}
+        for line in block.split("\n"):
+            line = line.strip()
+            lower = line.lower()
+            if lower.startswith("title") and ":" in line:
+                movie["title"] = line.split(":", 1)[1].strip()
+            elif lower.startswith("year") and ":" in line:
+                movie["year"] = line.split(":", 1)[1].strip()
+            elif lower.startswith("director") and ":" in line:
+                movie["director"] = line.split(":", 1)[1].strip()
+            elif "why it fits" in lower and ":" in line:
+                movie["why_it_fits"] = line.split(":", 1)[1].strip()
+        if movie.get("title"):
+            recommendations.append(movie)
+    return recommendations
+
+
 def get_recommendations_from_gemini(user_movies):
     """
-    FUTURE FUNCTION - Get movie recommendations from Google Gemini API.
-    
-    This function is a placeholder for future implementation.
-    
-    Flow:
-    1. Google Gemini API generates 10 movie recommendations
-    2. App selects top 3
-    3. For each movie:
-       - Call get_movie_data() for metadata
-       - Call get_movie_poster() for poster
-    4. Return formatted movie list
-    
-    Args:
-        user_movies: List of movies the user has watched/liked
-    
-    Returns:
-        list: List of recommended movies with full metadata
+    Get 3 movie recommendations from Google Gemini API based on parsed CSV (watched) movies.
+    user_movies: list of dicts with 'name' and 'year' (from CSV).
+    Returns: list of up to 3 dicts with title, director, year, why_it_fits.
     """
-    # PLACEHOLDER - Do NOT implement yet
-    # Will integrate with Google Gemini API later
-    pass
+    if not gemini_ask_question:
+        print("[Recommendations] Gemini client not available (check .env / GEMINI_API_KEY)")
+        return []
+    watched = [f"{m.get('name', '')} ({m.get('year', '')})" for m in user_movies if (m.get("name") or "").strip()]
+    if not watched:
+        print("[Recommendations] No movie names in CSV (check column headers: Name/Movie/Title)")
+        return []
+    raw = gemini_ask_question(watched)
+    if not raw or (isinstance(raw, str) and "Error:" in raw):
+        print(f"[Recommendations] Gemini returned error or empty: {repr(raw)[:200]}")
+        return []
+    parsed = _parse_gemini_recommendations(raw)
+    if not parsed and len(raw) > 50:
+        print(f"[Recommendations] Parser got 0. Raw response (first 500 chars):\n{raw[:500]}")
+    return parsed
 
 
 # ==================== ROUTES ====================
@@ -112,7 +157,8 @@ def get_recommendations_from_gemini(user_movies):
 @app.route('/upload', methods=['POST'])
 def upload_file():
     """Handle CSV file upload and parse its contents"""
-    
+    print("\n========== CSV UPLOAD RECEIVED ==========", flush=True)
+
     # Check if file is present in request
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
@@ -141,22 +187,60 @@ def parse_csv(raw_file):
     """Parse CSV file and return movie data"""
     rows = list(raw_file)
     if not rows:
+        print("[Upload] No rows in CSV", flush=True)
         return jsonify({'error': "NO DATA IN CSV"}), 400
 
-    # Parse CSV data
+    print(f"[Upload] Parsing {len(rows)} rows...", flush=True)
+    # Parse CSV data (support common column name variants)
     parsed_data = []
     for row in rows:
+        name = (row.get('Name') or row.get('name') or row.get('Movie') or
+                row.get('movie') or row.get('Title') or row.get('title') or '')
+        year = (row.get('Year') or row.get('year') or '')
         parsed_data.append({
-            'date': row.get('Date', ''),
-            'name': row.get('Name', ''),
-            'year': row.get('Year', ''),
-            'letterboxd_uri': row.get('Letterboxd URI', '')
+            'date': row.get('Date', '') or row.get('date', ''),
+            'name': name.strip(),
+            'year': str(year).strip() if year else '',
+            'letterboxd_uri': row.get('Letterboxd URI', '') or row.get('letterboxd_uri', '')
         })
-    
+
+    # Get 3 recommended movies from Gemini (must be movies they haven't seen)
+    try:
+        recommendations = get_recommendations_from_gemini(parsed_data)
+    except Exception as e:
+        print(f"[Gemini error] {e}")
+        recommendations = []
+
+    # Filter out any recommendation that is in the user's watch list (safety check)
+    watched_titles = {(m.get("name") or "").strip().lower() for m in parsed_data if (m.get("name") or "").strip()}
+    if watched_titles:
+        original_count = len(recommendations)
+        recommendations = [m for m in recommendations if (m.get("title") or "").strip().lower() not in watched_titles]
+        if len(recommendations) < original_count:
+            print(f"[Recommendations] Filtered out {original_count - len(recommendations)} that were in watch list", flush=True)
+
+    print(f"[Upload] Parsed {len(parsed_data)} rows, got {len(recommendations)} recommendations", flush=True)
+    if not recommendations:
+        with_names = sum(1 for m in parsed_data if (m.get('name') or '').strip())
+        print(f"[Recommendations] Got 0. Rows: {len(parsed_data)}, with names: {with_names}, Gemini available: {gemini_ask_question is not None}", flush=True)
+    if recommendations:
+        print("\n--- 3 RECOMMENDED MOVIES ---", flush=True)
+        for i, movie in enumerate(recommendations, 1):
+            title = movie.get("title", "?")
+            year = movie.get("year", "?")
+            director = movie.get("director", "?")
+            why = movie.get("why_it_fits", "")
+            print(f"  {i}. {title} ({year}) – {director}", flush=True)
+            if why:
+                print(f"     Why: {why}", flush=True)
+        print("-----------------------------\n", flush=True)
+
+    print("========== UPLOAD COMPLETE ==========\n", flush=True)
     return jsonify({
         'message': 'CSV uploaded and parsed successfully',
         'rows': len(parsed_data),
-        'data': parsed_data
+        'data': parsed_data,
+        'recommendations': recommendations
     }), 200
 
 

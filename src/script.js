@@ -79,12 +79,15 @@ function handleFile(file) {
   })
   .then(data => {
     console.log(data);
-    setStatus(`✅ Recommendations ready! Found ${data.rows} movies.`, "success");
-    
-    // Redirect to recommendations page after short delay
-    setTimeout(() => {
-      window.location.href = 'recommend.html';
-    }, 1500);
+    const hasRecommendations = data.recommendations && data.recommendations.length > 0;
+    if (hasRecommendations) {
+      setStatus(`✅ Recommendations ready! Found ${data.rows} movies.`, "success");
+      setTimeout(() => {
+        window.location.href = 'recommend.html';
+      }, 1000);
+    } else {
+      setStatus("❌ Could not get recommendations. Check your CSV (use Name/Movie and Year columns) and try again.", "error");
+    }
   })
   .catch(error => {
     console.error("Error:", error);
